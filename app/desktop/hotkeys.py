@@ -1,38 +1,24 @@
 from pynput import keyboard
 
-class HotkeyManager:
-    def __init__(self, on_capture, on_restore):
-        self.on_capture = on_capture
-        self.on_restore = on_restore
-        self._listener = None
-        self._pressed = set()
+COMBINATIONS = [
+    {keyboard.Key.shift, keyboard.KeyCode(char='a')}, #combo 1
+    {keyboard.Key.shift, keyboard.KeyCode(char='A')} #combo 2
 
-    def _on_press(self, key):
-        self._pressed.add(key)
-        if self._combo({"<ctrl>", "<alt>", "c"}):
-            self.on_capture()
-        if self._combo({"<ctrl>", "<alt>", "r"}):
-            self.on_restore()
+]
+current = set()
 
-    def _on_release(self, key):
-        self._pressed.discard(key)
+def startListener(execute_callback):
 
-    def _combo(self, keys):
-        names = set()
-        for k in self._pressed:
-            if isinstance(k, keyboard.Key):
-                names.add(f"<{k.name}>")
-            else:
-                try:
-                    names.add(k.char.lower())
-                except Exception:
-                    pass
-        return keys.issubset(names)
+    def on_press(key):
+        if any([key in COMBO for COMBO in COMBINATIONS]):
+            current.add(key)
+            if any(all(k in current for k in COMBO) for COMBO in COMBINATIONS): # Check if any combination is complete. all (k in current for k in COMBO) means return true if each k in combo has a corresponding k in current
+                 execute_callback()
 
-    def start(self):
-        self._listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release)
-        self._listener.start()
+    def on_release(key): 
+        if any([key in COMBO for COMBO in COMBINATIONS]): #if you release a key and it is in a combo, remove key from current
+            current.discard(key) #discard does not raise an error if the key is not found, safer than remove
 
-    def stop(self):
-        if self._listener:
-            self._listener.stop()
+    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        listener.join()
+        
