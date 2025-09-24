@@ -1,11 +1,13 @@
 from fastapi import FastAPI
 from sqlmodel import SQLModel, Field, create_engine, Session
+import sys
 from pydantic import BaseModel
 import os
 
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data.db")
 engine = create_engine(f"sqlite:///{DB_PATH}")
+print("Running Python from:", sys.executable)
 
 class Message(SQLModel, table=True): #inhertis from SQLModel and table=True to tell SQLModel this is a table for the database
     id: int | None = Field(default=None, primary_key=True)
