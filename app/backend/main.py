@@ -1,32 +1,45 @@
 from fastapi import FastAPI
+from contextlib import asynccontextmanager
 from sqlmodel import SQLModel, Field, create_engine, Session
 import sys
 from pydantic import BaseModel
 import os
 
-
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data.db")
+# --- DB setup ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "..", "data.db")
 engine = create_engine(f"sqlite:///{DB_PATH}")
 print("Running Python from:", sys.executable)
 
-class Message(SQLModel, table=True): #inhertis from SQLModel and table=True to tell SQLModel this is a table for the database
+# --- Models ---
+class Message(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     text: str
 
-class HighlightedText(BaseModel): #basemodel makes sure that anytime something trues to use this class, the data passed are in the right format. eg: without it, if you tried to pass a boolean into text, it will raise an error
+class HighlightedText(BaseModel):
     text: str
 
-app = FastAPI() #event listener blueprint. uvicorn turns it alive
+# only run once when the app starts (new on_startup)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    SQLModel.metadata.create_all(engine)
+    yield
+    # Shutdown (optional). put cleanup here if needed
 
-@app.on_event("startup")
-def startup():
-    SQLModel.metadata.create_all(engine) #looos through every class that uses SQLModel and creates the database tables for it if they don't exist
+app = FastAPI(lifespan=lifespan)
 
+# --- Routes ---
 @app.post("/add")
 def add_message(payload: HighlightedText):
-   
     with Session(engine) as s:
-        s.add(Message(text=payload.text)) #add the highlighted text to the database
+        msg = Message(text=payload.text)
+        s.add(msg)
         s.commit()
-    return {"ok": True}
+        s.refresh(msg)  # grab the auto-generated id
+    return {"ok": True, "id": msg.id}
 
+# (Optional) quick health check so / doesn't 404
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "service": "momentum-api"}
