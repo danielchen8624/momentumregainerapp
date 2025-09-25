@@ -1,18 +1,20 @@
 from hotkeys import startListener
-from capture import capture_selected_text
+from clip_capture import capture_selected_text
 import requests
 
 API_URL = "http://127.0.0.1:4545"
 
 def execute():
-    text = capture_selected_text()
+    text, changed = capture_selected_text()
+    if not changed:
+        print("No selection (clipboard didn’t change). Skipping send.")
+        return
     if not text:
-        print("No selection detected.")
+        print("Selection has no plain-text. Skipping.")
         return
     if len(text) > 20000:
-        print("Selection too large; skipping (>20k chars).")
+        print("Selection too large; skipping.")
         return
-
     try:
         r = requests.post(f"{API_URL}/add", json={"text": text}, timeout=5)
         r.raise_for_status()
