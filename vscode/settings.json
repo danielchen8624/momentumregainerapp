@@ -1,4 +1,4 @@
 {
-  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.defaultInterpreterPath": "MOMENTUMAPP/momentum/.venv/bin/python3",
   "python.terminal.activateEnvironment": true
 }

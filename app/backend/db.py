@@ -10,4 +10,4 @@ data_dir = Path(user_data_dir(APP_NAME, APP_AUTHOR))
 data_dir.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = data_dir / "data.db"          # e.g. macOS: ~/Library/Application Support/Momentum/data.db
-engine = create_engine(f"sqlite:///{DB_PATH}")
+engine = create_engine(f"sqlite:///{DB_PATH}") 

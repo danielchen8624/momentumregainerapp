@@ -12,7 +12,6 @@ print("Running Python from:", sys.executable)
 class Message(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     text: str
-
 class HighlightedText(BaseModel):
     text: str
 
@@ -28,10 +27,10 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/add")
 def add_message(payload: HighlightedText):
     with Session(engine) as s:
-        msg = Message(text=payload.text)
-        s.add(msg)
-        s.commit()
-        s.refresh(msg)
+        msg = Message(text=payload.text) # create a new Message instance
+        s.add(msg) # add it to the session
+        s.commit() # commit to save it to the database
+        s.refresh(msg) 
     return {"ok": True, "id": msg.id}
 
 @app.get("/", include_in_schema=False)
