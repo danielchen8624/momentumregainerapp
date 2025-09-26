@@ -1,165 +1,295 @@
-import platform, time, subprocess, pyperclip
-from pynput.keyboard import Controller, Key
+# app/desktop/clip_capture.py
+import platform, time, subprocess, os, sys
 
-DEFAULT_WAIT_SEC = 0.45
-MAX_WAIT_MS      = 2000
-POLL_EVERY_MS    = 25
-_kb = Controller()
+_IS_MAC = platform.system() == "Darwin"
 
-# ---------- keystroke & menu helpers ----------
-def _press_copy_mac_via_pynput():
-    with _kb.pressed(Key.cmd):
-        _kb.press('c'); _kb.release('c')
+# Try to import macOS-specific clipboard APIs
+if _IS_MAC:
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString, NSAttributedString
+        from AppKit import NSPasteboardTypeHTML  # may be None on older macOS; we guard
+        from Foundation import NSData
+        from Cocoa import NSWorkspace
+        _HAVE_PYOBJC = True
+    except Exception:
+        _HAVE_PYOBJC = False
+else:
+    _HAVE_PYOBJC = False
 
-def _press_copy_mac_via_applescript():
-    subprocess.run(
-        ['osascript', '-e',
-         'tell application "System Events" to keystroke "c" using command down'],
-        check=False
-    )
+# Fallback cross-platform text clipboard
+try:
+    import pyperclip
+    _HAVE_PYPERCLIP = True
+except Exception:
+    _HAVE_PYPERCLIP = False
 
-def _click_copy_menu_mac() -> bool:
+# Pynput only used for the "pynput Cmd+C" fallback attempt
+try:
+    from pynput import keyboard
+    _HAVE_PYNPUT = True
+except Exception:
+    _HAVE_PYNPUT = False
+
+
+# ---------------------------
+# Utility: logging helper
+# ---------------------------
+def _log(msg: str):
+    print(msg, flush=True)
+
+
+# ---------------------------
+# macOS helpers (pyobjc path)
+# ---------------------------
+def _pb():
+    return NSPasteboard.generalPasteboard()
+
+def _pb_change_count():
+    return _pb().changeCount()
+
+def _pb_snapshot():
     """
-    Tries to click Edit -> Copy in the frontmost app using UI scripting.
-    Returns True if the AppleScript ran without error (not a guarantee the app has that menu).
+    Take a 'snapshot' of current pasteboard items (all types), so we can restore later.
+    We'll store types + data for each item.
     """
-    script = r'''
+    board = _pb()
+    items = board.pasteboardItems() or []
+    snap = []
+    for item in items:
+        # Collect per-type data
+        types = item.types() or []
+        entry = []
+        for t in types:
+            data = item.dataForType_(t)
+            if data is not None:
+                entry.append((str(t), bytes(data)))
+        snap.append(entry)
+    return snap
+
+def _pb_restore(snapshot):
+    """
+    Restore pasteboard from snapshot created by _pb_snapshot.
+    """
+    board = _pb()
+    board.clearContents()
+    # Rebuild items by writing per-type data via a temporary NSAttributedString or NSString where possible
+    # Simpler approach: re-add only the richest item (this keeps images/rtf/html if present)
+    # If multiple items existed, we add them all.
+    for entry in snapshot:
+        # We write each type back. PyObjC writing requires setData:forType:
+        # We need an NSPasteboardWriting-conforming object; we can directly setData for each type on pasteboard
+        # by creating a new item per entry.
+        from AppKit import NSPasteboardItem
+        pbi = NSPasteboardItem.alloc().init()
+        for t, data in entry:
+            nsdata = NSData.dataWithBytes_length_(data, len(data))
+            pbi.setData_forType_(nsdata, t)
+        board.writeObjects_([pbi])
+
+def _frontmost_app_name():
+    try:
+        ws = NSWorkspace.sharedWorkspace()
+        app = ws.frontmostApplication()
+        return str(app.localizedName())
+    except Exception:
+        return "Unknown"
+
+def _read_text_from_pasteboard_mac():
+    board = _pb()
+    # 1) Plain string
+    s = board.stringForType_(NSPasteboardTypeString)
+    if s:
+        return str(s)
+
+    # 2) HTML -> plain text (if supported)
+    # Some PyObjC versions expose NSPasteboardTypeHTML; if missing, attempt using UTI
+    html_types = []
+    try:
+        if NSPasteboardTypeHTML:
+            html_types.append(NSPasteboardTypeHTML)
+    except Exception:
+        pass
+    html_types.append("public.html")
+
+    for t in html_types:
+        try:
+            data = board.dataForType_(t)
+            if data:
+                # Convert HTML to attributed string -> string
+                attr, _ = NSAttributedString.alloc().initWithHTML_documentAttributes_(data, None)
+                if attr:
+                    return str(attr.string())
+        except Exception:
+            pass
+
+    # 3) RTF -> plain text
+    rtf_types = ["public.rtf", "NeXT Rich Text Format"]
+    for t in rtf_types:
+        try:
+            data = board.dataForType_(t)
+            if data:
+                attr, _ = NSAttributedString.alloc().initWithRTF_documentAttributes_(data, None)
+                if attr:
+                    return str(attr.string())
+        except Exception:
+            pass
+
+    return ""
+
+
+def _menu_copy_via_applescript():
+    """
+    Use System Events to invoke Edit -> Copy on the frontmost app.
+    This is more 'user-like' than synthetic keystrokes.
+    """
+    osa = r'''
+    try
+        tell application "System Events"
+            set frontApp to first application process whose frontmost is true
+            tell frontApp
+                try
+                    click menu item "Copy" of menu 1 of menu bar item "Edit" of menu bar 1
+                    return "OK"
+                on error
+                    return "NO_EDIT_MENU"
+                end try
+            end tell
+        end tell
+    on error
+        return "ERROR"
+    end try
+    '''
+    out = subprocess.run(["osascript", "-e", osa], capture_output=True, text=True)
+    return (out.returncode == 0) and ("OK" in (out.stdout or ""))
+
+
+def _cmd_c_via_applescript():
+    osa = r'''
     tell application "System Events"
-      set frontApp to first application process whose frontmost is true
-      try
-        click menu item "Copy" of menu 1 of menu bar item "Edit" of menu bar 1 of frontApp
-        return "ok"
-      on error errMsg
-        return "err:" & errMsg
-      end try
+        keystroke "c" using command down
     end tell
     '''
+    out = subprocess.run(["osascript", "-e", osa], capture_output=True)
+    return out.returncode == 0
+
+
+def _cmd_c_via_pynput():
+    if not _HAVE_PYNPUT:
+        return False
+    k = keyboard.Controller()
     try:
-        out = subprocess.check_output(['osascript', '-e', script], text=True).strip()
-        return out == "ok"
+        with k.pressed(keyboard.Key.cmd):
+            k.press('c')
+            k.release('c')
+        return True
     except Exception:
         return False
 
-def _press_copy_other():
-    with _kb.pressed(Key.ctrl):
-        _kb.press('c'); _kb.release('c')
 
-# ---------- mac pasteboard helpers ----------
-def _front_app_name_mac() -> str:
-    try:
-        out = subprocess.check_output(
-            ['osascript', '-e',
-             'tell application "System Events" to get name of (first application process whose frontmost is true)'],
-            text=True
-        ).strip()
-        return out
-    except Exception:
-        return "unknown"
-
-def _pb_change_count():
-    from AppKit import NSPasteboard
-    pb = NSPasteboard.generalPasteboard()
-    return pb.changeCount(), pb
-
-def _wait_for_change(prev_count, timeout_ms=MAX_WAIT_MS):
-    from AppKit import NSPasteboard
-    start = time.time()
-    while (time.time() - start) * 1000 < timeout_ms:
-        if NSPasteboard.generalPasteboard().changeCount() > prev_count:
+def _wait_for_change_count(before, timeout_s=1.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if _pb_change_count() != before:
             return True
-        time.sleep(POLL_EVERY_MS / 1000.0)
+        time.sleep(0.02)
     return False
 
-def _snapshot_pasteboard_mac():
-    try:
-        from AppKit import NSPasteboard
-        items = NSPasteboard.generalPasteboard().pasteboardItems() or []
-        snap = []
-        for it in items:
-            entry = {}
-            for t in it.types() or []:
-                data = it.dataForType_(t)
-                if data:
-                    entry[str(t)] = bytes(data)
-            snap.append(entry)
-        return snap
-    except Exception:
-        return None
 
-def _restore_pasteboard_mac(snapshot):
-    try:
-        if not snapshot:
-            return
-        from AppKit import NSPasteboard, NSPasteboardItem
-        from Foundation import NSData
-        pb = NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        new_items = []
-        for entry in snapshot:
-            it = NSPasteboardItem.alloc().init()
-            for t, raw in entry.items():
-                nsdata = NSData.dataWithBytes_length_(raw, len(raw))
-                it.setData_forType_(nsdata, t)
-            new_items.append(it)
-        if new_items:
-            pb.writeObjects_(new_items)
-    except Exception:
-        pass
-
-# ---------- public API ----------
-def capture_selected_text(wait_sec: float = DEFAULT_WAIT_SEC) -> tuple[str, bool]:
+# ---------------------------
+# Cross-platform fallback
+# ---------------------------
+def _fallback_text_copy_attempt():
     """
-    Returns (text, changed). 'changed' is True only if the pasteboard changed after our Copy attempts.
-    On macOS we snapshot/restore the clipboard (full fidelity).
+    Weak, but better than nothing for non-mac:
+    Try to read current clipboard text with pyperclip.
     """
-    system = platform.system()
+    if not _HAVE_PYPERCLIP:
+        return ("", False)
+    try:
+        before = pyperclip.paste()
+        # Try to synthesize Ctrl+C (only if pynput is available)
+        changed = False
+        if _HAVE_PYNPUT:
+            k = keyboard.Controller()
+            try:
+                with k.pressed(keyboard.Key.ctrl):
+                    k.press('c'); k.release('c')
+                time.sleep(0.1)
+                after = pyperclip.paste()
+                changed = (after != before)
+                return (after if changed else "", changed)
+            except Exception:
+                pass
+        # last resort: just return whatever is in the clipboard
+        return (before or "", bool(before))
+    except Exception:
+        return ("", False)
 
-    if system == "Darwin":
-        appname = _front_app_name_mac()
-        print(f"[cap] frontmost app: {appname}")
 
-        snapshot = _snapshot_pasteboard_mac()
-        text, changed = "", False
+# ---------------------------
+# Public entry: capture
+# ---------------------------
+def capture_selected_text():
+    """
+    Returns: (text: str, changed: bool)
+    - 'changed' True iff we detected the pasteboard actually changed during our attempts.
+    """
+    # Let the hotkey release & app UI settle (prevents selection loss in Chrome/Electron).
+    time.sleep(0.12)
 
-        # Attempt A: menu click
-        prev, _ = _pb_change_count()
-        print("[cap] attempt: menu Edit->Copy")
-        if _click_copy_menu_mac():
-            changed = _wait_for_change(prev, timeout_ms=MAX_WAIT_MS)
-            print(f"[cap] changed after menu click? {changed}")
+    if not _IS_MAC or not _HAVE_PYOBJC:
+        # Non-mac or missing pyobjc – do a best-effort fallback
+        _log("[cap] (fallback) using pyperclip / Ctrl+C path")
+        return _fallback_text_copy_attempt()
 
-        # Attempt B: AppleScript keystroke (if still no change)
-        if not changed:
-            prev, _ = _pb_change_count()
-            print("[cap] attempt: AppleScript Cmd+C")
-            _press_copy_mac_via_applescript()
-            changed = _wait_for_change(prev, timeout_ms=MAX_WAIT_MS)
-            print(f"[cap] changed after AppleScript? {changed}")
+    # macOS + pyobjc path (full-fidelity)
+    app_name = _frontmost_app_name()
+    _log(f"[cap] frontmost app: {app_name}")
 
-        # Attempt C: pynput keystroke (final fallback)
-        if not changed:
-            prev, _ = _pb_change_count()
-            print("[cap] attempt: pynput Cmd+C")
-            _press_copy_mac_via_pynput()
-            changed = _wait_for_change(prev, timeout_ms=MAX_WAIT_MS)
-            print(f"[cap] changed after pynput? {changed}")
+    # Snapshot current pasteboard to restore later
+    try:
+        snapshot = _pb_snapshot()
+    except Exception:
+        snapshot = None
 
-        if changed:
-            time.sleep(min(wait_sec, 0.3))
-            text = (pyperclip.paste() or "").strip()
-            print(f"[cap] captured len={len(text)} preview={text[:60]!r}")
-        else:
-            print("[cap] no pasteboard change detected; not capturing.")
+    before = _pb_change_count()
+    changed = False
 
-        _restore_pasteboard_mac(snapshot)
-        return text, changed
+    # Attempt 1: Menu Edit->Copy (most 'human-like')
+    _log("[cap] attempt: menu Edit->Copy")
+    if _menu_copy_via_applescript():
+        changed = _wait_for_change_count(before, timeout_s=1.0)
+    _log(f"[cap] changed after menu click? {changed}")
+    if not changed:
+        # Attempt 2: AppleScript Cmd+C
+        _log("[cap] attempt: AppleScript Cmd+C")
+        if _cmd_c_via_applescript():
+            changed = _wait_for_change_count(before, timeout_s=1.0)
+        _log(f"[cap] changed after AppleScript? {changed}")
 
-    # Non-mac: text-only
-    prev_text = pyperclip.paste() or ""
-    _press_copy_other()
-    time.sleep(wait_sec)
-    text = (pyperclip.paste() or "").strip()
-    changed = bool(text) and (text != prev_text)
-    pyperclip.copy(prev_text or "")
-    print(f"[cap] (non-mac) changed={changed} preview={text[:60]!r}")
-    return text, changed
+    if not changed:
+        # Attempt 3: pynput Cmd+C
+        _log("[cap] attempt: pynput Cmd+C")
+        if _cmd_c_via_pynput():
+            changed = _wait_for_change_count(before, timeout_s=1.0)
+        _log(f"[cap] changed after pynput? {changed}")
+
+    text = ""
+    if changed:
+        # Read text (plain → HTML→text → RTF→text)
+        try:
+            text = _read_text_from_pasteboard_mac() or ""
+        except Exception:
+            text = ""
+
+    else:
+        _log("[cap] no pasteboard change detected; not capturing.")
+
+    # Restore original pasteboard (best effort)
+    if snapshot is not None:
+        try:
+            _pb_restore(snapshot)
+        except Exception:
+            pass
+
+    return (text, changed)

@@ -1,37 +1,43 @@
+# app/desktop/hotkeys.py
 from pynput import keyboard
-import time
+import threading
+import os
 
-A_KEYS = {keyboard.KeyCode(char='a'), keyboard.KeyCode(char='A')}
-SHIFT = keyboard.Key.shift
+def _hotkey_from_env(default="cmd+shift+v"):
+    """
+    Allow overriding with HOTKEY env var, e.g.:
+      HOTKEY=ctrl+alt+g python run_all.py
+    """
+    raw = os.environ.get("HOTKEY")
+    if raw:
+        return raw.lower()
+    return default
 
-def startListener(execute_callback):
-    current = set()
-    armed = False  # becomes True once Shift+A is fully pressed
+def startListener(execute_callback, debug=False):
+    hotkey = _hotkey_from_env("cmd+shift+v")  # default = Cmd+Shift+V
+    # Convert to pynput GlobalHotKeys format: "cmd+shift+v" -> "<cmd>+<shift>+v"
+    parts = [p.strip().lower() for p in hotkey.split("+") if p.strip()]
+    mods = []
+    key = None
+    for p in parts:
+        if p in ("cmd", "ctrl", "alt", "shift"):
+            mods.append(f"<{p}>")
+        else:
+            key = p
+    if key is None:
+        raise ValueError(f"Hotkey needs a key: {hotkey}")
+    seq = "+".join(mods + [key])
 
-    def _in_combo_set(key):
-        return key == SHIFT or key in A_KEYS
+    if debug:
+        print(f"[hotkeys] binding {seq}")
 
-    def _combo_fully_down():
-        return SHIFT in current and any(k in current for k in A_KEYS)
+    def on_activate():
+        if debug:
+            print(f"[hotkeys] trigger: {seq}")
+        threading.Thread(target=execute_callback, daemon=True).start()
 
-    def _any_combo_key_down():
-        return SHIFT in current or any(k in current for k in A_KEYS)
-
-    def on_press(key):
-        nonlocal armed
-        if _in_combo_set(key):
-            current.add(key)
-            if _combo_fully_down():
-                armed = True
-
-    def on_release(key):
-        nonlocal armed
-        if _in_combo_set(key):
-            current.discard(key)
-            if armed and not _any_combo_key_down():
-                armed = False
-                time.sleep(0.05)  # let modifier fully release
-                execute_callback()
-
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-        listener.join()
+    h = keyboard.GlobalHotKeys({seq: on_activate})
+    h.start()
+    if debug:
+        print(f"[hotkeys] listener started with {seq} (suppression ON)")
+    h.join()  # keep the process alive
